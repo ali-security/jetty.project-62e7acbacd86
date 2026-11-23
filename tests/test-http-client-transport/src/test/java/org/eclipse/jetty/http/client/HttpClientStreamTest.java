@@ -1024,8 +1024,16 @@ public class HttpClientStreamTest extends AbstractTest
         };
         InputStreamContentProvider content = new InputStreamContentProvider(stream);
 
+        // Connect to a just-closed local port so the connect fails fast;
+        // 0.0.0.1 hangs instead of failing on Linux >= 5.3 kernels.
+        int closedPort;
+        try (java.net.ServerSocket probe = new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")))
+        {
+            closedPort = probe.getLocalPort();
+        }
+
         final CountDownLatch completeLatch = new CountDownLatch(1);
-        client.newRequest("0.0.0.1", connector.getLocalPort())
+        client.newRequest("127.0.0.1", closedPort)
                 .scheme(getScheme())
                 .content(content)
                 .send(result ->

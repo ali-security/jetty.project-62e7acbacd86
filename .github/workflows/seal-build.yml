@@ -1,0 +1,224 @@
+# Authored for sealed-libraries: Jetty 9.3.x has no GitHub Actions CI upstream
+# (only a Jenkinsfile: jdk8 + maven3 `mvn -B clean install`). This workflow
+# mirrors that build and runs the project's own surefire suites.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector (comma/space separated); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build (${{ matrix.leg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # jetty-util + everything it feeds (io/http/server/servlet/security/client/proxy), full suites; produces the release jars
+          - leg: util
+            modules: jetty-util,jetty-proxy,jetty-servlet
+          # remaining modules holding CVE-patched paths (servlets, http2, test-http-client-transport)
+          - leg: coverage
+            modules: jetty-servlets,jetty-http2/http2-hpack,jetty-http2/http2-common,jetty-http2/http2-server,jetty-http2/http2-client,jetty-http2/http2-http-client-transport,tests/test-http-client-transport
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      MAVEN_OPTS: "-Xmx3g -Djava.awt.headless=true"
+      TEST_FILTER: ${{ inputs.test-filter }}
+      # Non-test gates (lint/static analysis/licence/javadoc/signing) are disabled; tests still run.
+      MVN_SKIPS: "-Dmaven.javadoc.skip=true -Dcheckstyle.skip=true -Denforcer.skip=true -Dgpg.skip=true -Dlicense.skip=true -Dfindbugs.skip=true -Dpmd.skip=true -Dclirr.skip=true -Dsurefire.timeout=1200"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build runs on Zulu 8u172 so the root pom's java.version-activated 8u172
+      # profile sets alpn.version (needed by http2-http-client-transport and
+      # tests/test-http-client-transport). The runner's preinstalled JDK only
+      # supplies a current cacerts.
+      - name: Install Zulu JDK 8u172 and Maven 3.9.5
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o zulu.tgz https://cdn.azul.com/zulu/bin/zulu8.30.0.1-ca-jdk8.0.172-linux_x64.tar.gz
+          mkdir -p zulu && tar xzf zulu.tgz -C zulu
+          ZULU="$(ls -d "$RUNNER_TEMP"/zulu/*/)"; ZULU="${ZULU%/}"
+          ls "$ZULU" "$ZULU/jre/lib/security"
+          for c in "${JAVA_HOME_8_X64:-/nonexistent}/jre/lib/security/cacerts" "${JAVA_HOME_8_X64:-/nonexistent}/lib/security/cacerts" /etc/ssl/certs/java/cacerts "${JAVA_HOME_11_X64:-/nonexistent}/lib/security/cacerts"; do
+            if [ -f "$c" ]; then echo "cacerts from $c"; cp "$c" "$ZULU/jre/lib/security/cacerts"; break; fi
+          done
+          curl -fsSL -o maven.tgz https://archive.apache.org/dist/maven/maven-3/3.9.5/binaries/apache-maven-3.9.5-bin.tar.gz
+          tar xzf maven.tgz
+          MVN_HOME="$RUNNER_TEMP/apache-maven-3.9.5"
+          # Replace the default settings (whose http blocker breaks the jenkins-ci chain of
+          # jetty-version-maven-plugin) with Central + https repo.jenkins-ci.org.
+          cat > "$MVN_HOME/conf/settings.xml" <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-https</id>
+                <mirrorOf>*,!jenkins-ci</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+            <profiles>
+              <profile>
+                <id>jenkins-ci</id>
+                <repositories>
+                  <repository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></repository>
+                </repositories>
+                <pluginRepositories>
+                  <pluginRepository><id>jenkins-ci</id><url>https://repo.jenkins-ci.org/public/</url></pluginRepository>
+                </pluginRepositories>
+              </profile>
+            </profiles>
+            <activeProfiles><activeProfile>jenkins-ci</activeProfile></activeProfiles>
+          </settings>
+          EOF
+          echo "JAVA_HOME=$ZULU" >> "$GITHUB_ENV"
+          echo "$ZULU/bin" >> "$GITHUB_PATH"
+          echo "$MVN_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain
+        run: |
+          java -version
+          mvn -version
+
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER="${TEST_FILTER// /,}"
+            mvn -B -e install -fae -pl "${{ matrix.modules }}" -am $MVN_SKIPS \
+              -Dtest="$FILTER" -DfailIfNoTests=false 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          elif [ "${{ matrix.leg }}" = "util" ]; then
+            mvn -B -e install -fae -pl "${{ matrix.modules }}" -am $MVN_SKIPS 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          else
+            # build the upstream reactor modules without their tests (they run in the util leg) ...
+            mvn -B -e install -pl "${{ matrix.modules }}" -am -DskipTests $MVN_SKIPS 2>&1 | tail -n 60
+            # ... then run the full suites of the coverage modules themselves
+            mvn -B -e install -fae -pl "${{ matrix.modules }}" $MVN_SKIPS 2>&1 | tee "$RUNNER_TEMP/mvn.log"
+          fi
+
+      - name: Test summary (per class, skipped tests with reasons, total)
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+
+          src_index = {}
+          for p in glob.glob('**/src/test/java/**/*.java', recursive=True):
+              rel = p.split('/src/test/java/', 1)[1][:-5].replace('/', '.')
+              src_index.setdefault(rel, p)
+
+          def read(cls):
+              p = src_index.get(cls)
+              return open(p, encoding='utf-8', errors='replace').read() if p else None
+
+          def superclass(cls, text):
+              m = re.search(r'class\s+\w+(?:<[^{]*?>)?\s+extends\s+([\w.]+)', text)
+              if not m:
+                  return None
+              name = m.group(1)
+              if '.' in name:
+                  return name
+              imp = re.search(r'import\s+([\w.]+\.' + re.escape(name) + r')\s*;', text)
+              if imp:
+                  return imp.group(1)
+              return cls.rsplit('.', 1)[0] + '.' + name
+
+          def method_reason(text, method):
+              m = re.search(r'((?:\s*(?://[^\n]*|@[\w.]+(?:\([^)]*\))?)\s*)*)\s*public\s+void\s+' + re.escape(method) + r'\s*\(', text)
+              if not m:
+                  return None
+              start = m.end()
+              depth, i = 0, text.find('{', start)
+              body_start = i
+              while i < len(text):
+                  if text[i] == '{': depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                      if depth == 0: break
+                  i += 1
+              body = text[body_start:i]
+              parts = []
+              ann = m.group(1) or ''
+              ig = re.search(r'@Ignore(\([^)]*\))?', ann)
+              if ig:
+                  parts.append('@Ignore' + (ig.group(1) or ''))
+              parts += [l.strip() for l in ann.splitlines() if l.strip().startswith('//')]
+              parts += [l.strip() for l in body.splitlines() if 'Assume' in l or 'assume' in l]
+              return '; '.join(parts) if parts else 'method found, no inline Ignore/Assume (see class-level guard)'
+
+          def class_reason(text):
+              parts = []
+              ig = re.search(r'@Ignore(\([^)]*\))?\s*(?:@\w+[^\n]*\s*)*public\s+(?:abstract\s+)?class', text)
+              if ig:
+                  parts.append('class @Ignore' + (ig.group(1) or ''))
+              for l in text.splitlines():
+                  s = l.strip()
+                  if ('Assume' in s or 'assume' in s) and not s.startswith('import'):
+                      parts.append(s)
+                  elif '? null' in s:
+                      parts.append(s)
+              return '; '.join(dict.fromkeys(parts))
+
+          def reason_for(cls, method):
+              method = re.sub(r'\[.*$', '', method)
+              seen, c, cls_reasons = 0, cls, []
+              while c and seen < 6:
+                  text = read(c)
+                  if text is None:
+                      break
+                  r = method_reason(text, method)
+                  if r:
+                      cr = class_reason(text)
+                      return r + ((' | class guards: ' + cr) if cr and 'no inline' in r else '') + ' (in ' + c + ')'
+                  cr = class_reason(text)
+                  if cr:
+                      cls_reasons.append(c + ': ' + cr)
+                  c = superclass(c, text); seen += 1
+              return ' | '.join(cls_reasons) if cls_reasons else 'skipped by surefire (no source reason found)'
+
+          tot = {'tests': 0, 'failures': 0, 'errors': 0, 'skipped': 0}
+          skipped = []
+          for f in sorted(glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception as e:
+                  print('unparseable', f, e); continue
+              suites = [root] if root.tag == 'testsuite' else root.findall('testsuite')
+              for s in suites:
+                  c = {k: int(s.get(k, 0) or 0) for k in tot}
+                  for k in tot: tot[k] += c[k]
+                  print('%-90s run=%d fail=%d err=%d skip=%d' % (s.get('name'), c['tests'], c['failures'], c['errors'], c['skipped']))
+                  for tc in s.findall('testcase'):
+                      sk = tc.find('skipped')
+                      if sk is not None:
+                          cls = tc.get('classname') or s.get('name')
+                          msg = (sk.get('message') or '').strip()
+                          skipped.append((cls, tc.get('name'), msg or reason_for(cls, tc.get('name'))))
+          print()
+          print('=== SKIPPED TESTS (%d) ===' % len(skipped))
+          for cls, name, why in skipped:
+              print('SKIPPED %s#%s -- reason: %s' % (cls, name, why))
+          print()
+          passed = tot['tests'] - tot['failures'] - tot['errors'] - tot['skipped']
+          print('TOTAL tests run: %d, passed: %d, failures: %d, errors: %d, skipped: %d' % (tot['tests'], passed, tot['failures'], tot['errors'], tot['skipped']))
+          PYEOF
+
+      - name: Upload release jars
+        if: matrix.leg == 'util'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-util-jars
+          path: |
+            jetty-util/target/jetty-util-*.jar
+            !jetty-util/target/*-sources.jar
+            !jetty-util/target/*-javadoc.jar
+            !jetty-util/target/*-tests.jar
+          if-no-files-found: error
