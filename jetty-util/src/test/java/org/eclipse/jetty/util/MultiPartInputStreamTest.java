@@ -1041,6 +1041,129 @@ public class MultiPartInputStreamTest
         assertEquals("truth=beauty", baos.toString("US-ASCII"));
     }
 
+    @Test
+    public void testTooManyParts() throws Exception
+    {
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, 3072, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(3).getBytes()),
+                                                                         _contentType,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         2);
+        mpis.setDeleteOnExit(true);
+        try
+        {
+            mpis.getParts();
+            fail("Expected too many parts to be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts [3 > 2]"));
+        }
+
+        // the error is latched, subsequent calls fail the same way
+        try
+        {
+            mpis.getPart("part0");
+            fail("Expected too many parts to be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts"));
+        }
+    }
+
+    @Test
+    public void testNoPartsAllowed() throws Exception
+    {
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, 3072, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(1).getBytes()),
+                                                                         _contentType,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         0);
+        mpis.setDeleteOnExit(true);
+        try
+        {
+            mpis.getParts();
+            fail("Expected parts to be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts [1 > 0]"));
+        }
+    }
+
+    @Test
+    public void testMaxPartsNotExceeded() throws Exception
+    {
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, 1024, 3072, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(3).getBytes()),
+                                                                         _contentType,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         3);
+        mpis.setDeleteOnExit(true);
+        Collection<Part> parts = mpis.getParts();
+        assertEquals(3, parts.size());
+    }
+
+    @Test
+    public void testUnlimitedParts() throws Exception
+    {
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, -1, -1, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(1500).getBytes()),
+                                                                         _contentType,
+                                                                         config,
+                                                                         _tmpDir,
+                                                                         -1);
+        mpis.setDeleteOnExit(true);
+        Collection<Part> parts = mpis.getParts();
+        assertEquals(1500, parts.size());
+    }
+
+    @Test
+    public void testDefaultMaxParts() throws Exception
+    {
+        // The original constructor applies a default limit of 1000 parts
+        MultipartConfigElement config = new MultipartConfigElement(_dirname, -1, -1, 50);
+        MultiPartInputStreamParser mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(1000).getBytes()),
+                                                                         _contentType,
+                                                                         config,
+                                                                         _tmpDir);
+        mpis.setDeleteOnExit(true);
+        assertEquals(1000, mpis.getParts().size());
+
+        mpis = new MultiPartInputStreamParser(new ByteArrayInputStream(createManyPartsRequestString(1001).getBytes()),
+                                              _contentType,
+                                              config,
+                                              _tmpDir);
+        mpis.setDeleteOnExit(true);
+        try
+        {
+            mpis.getParts();
+            fail("Expected too many parts to be rejected");
+        }
+        catch (IllegalStateException e)
+        {
+            assertThat(e.getMessage(), Matchers.containsString("Form with too many parts [1001 > 1000]"));
+        }
+    }
+
+    private String createManyPartsRequestString(int numParts)
+    {
+        StringBuilder request = new StringBuilder();
+        for (int i = 0; i < numParts; i++)
+        {
+            request.append("--AaB03x\r\n");
+            request.append("content-disposition: form-data; name=\"part").append(i).append("\"\r\n");
+            request.append("\r\n");
+            request.append("value").append(i).append("\r\n");
+        }
+        request.append("--AaB03x--\r\n");
+        return request.toString();
+    }
+
 
 
 
